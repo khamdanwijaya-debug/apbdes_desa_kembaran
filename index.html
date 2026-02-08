@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>E-APBDes Cloud Sync</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
+        body { font-family: 'Plus Jakarta Sans', sans-serif; }
+        @media print {
+            .no-print { display: none !important; }
+            .print-only { display: block !important; }
+            body { background: white; padding: 0; }
+            main { padding: 0 !important; }
+        }
+        .loading-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(255, 255, 255, 0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+        }
+    </style>
+</head>
+<body class="bg-gray-50">
+    <div id="root"></div>
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, query } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+
+        // Global Firebase Configuration provided by environment
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'apbdes-default-cloud';
+
+        // React Logic
+        const { useState, useEffect, useMemo } = React;
+
+        const Icon = ({ name, size = 20, className = "" }) => {
+            useEffect(() => { if (window.lucide) window.lucide.createIcons(); }, [name]);
+            return <i data-lucide={name} style={{ width: size, height: size }} className={className}></i>;
+        };
+
+        const App = () => {
+            const [user, setUser] = useState(null);
+            const [activeTab, setActiveTab] = useState('dashboard');
+            const [loading, setLoading] = useState(true);
+            const [syncStatus, setSyncStatus] = useState('connecting'); // connecting, synced, error
+
+            // Data States
+            const [dataDesa, setDataDesa] = useState({
+                namaDesa: 'Memuat data...', kecamatan: '', kabupaten: '', tahunAnggaran: '2025',
+                kepalaDesa: '', ketuaBPD: '', sekretarisDesa: ''
+            });
+            const [pendapatan, setPendapatan] = useState([]);
+            const [belanja, setBelanja] = useState([]);
+
+            // 1. Authenticate
+            useEffect(() => {
+                const initAuth = async () => {
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(auth, __initial_auth_token);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (err) {
+                        console.error("Auth error:", err);
+                        setSyncStatus('error');
+                    }
+                };
+                initAuth();
+                return onAuthStateChanged(auth, (u) => {
+                    setUser(u);
+                    if (u) setSyncStatus('synced');
+                });
+            }, []);
+
+            // 2. Real-time Cloud Sync (Firestore)
+            useEffect(() => {
+                if (!user) return;
+
+                // Path Rule 1: /artifacts/{appId}/public/data/{collectionName}
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'anggaran_utama');
+
+                const unsubscribe = onSnapshot(docRef, (snapshot) => {
+                    if (snapshot.exists()) {
+                        const cloudData = snapshot.data();
+                        setDataDesa(cloudData.profil || dataDesa);
+                        setPendapatan(cloudData.pendapatan || []);
+                        setBelanja(cloudData.belanja || []);
+                    } else {
+                        // Initialize first time if cloud is empty
+                        saveToCloud(dataDesa, pendapatan, belanja);
+                    }
+                    setLoading(false);
+                    setSyncStatus('synced');
+                }, (error) => {
+                    console.error("Sync Error:", error);
+                    setSyncStatus('error');
+                });
+
+                return () => unsubscribe();
+            }, [user]);
+
+            // 3. Save Function
+            const saveToCloud = async (p, pend, bel) => {
+                if (!user) return;
+                setSyncStatus('syncing');
+                try {
+                    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'anggaran_utama');
+                    await setDoc(docRef, {
+                        profil: p,
+                        pendapatan: pend,
+                        belanja: bel,
+                        lastUpdated: new Date().toISOString(),
+                        updatedBy: user.uid
+                    });
+                    setSyncStatus('synced');
+                } catch (err) {
+                    setSyncStatus('error');
+                }
+            };
+
+            // Calculations
+            const totalP = useMemo(() => pendapatan.reduce((a, b) => a + (Number(b.nominal) || 0), 0), [pendapatan]);
+            const totalB = useMemo(() => belanja.reduce((a, b) => a + (Number(b.nominal) || 0), 0), [belanja]);
+            const belanjaOp = useMemo(() => belanja.filter(b => b.jenis === 'Operasional').reduce((a, b) => a + (Number(b.nominal) || 0), 0), [belanja]);
+            const rasioOp = totalP > 0 ? (belanjaOp / totalP) * 100 : 0;
+
+            const format = (n) => new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(n);
+
+            if (loading) return <div className="loading-overlay"><div className="flex flex-col items-center"><div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mb-4"></div><p className="font-bold text-gray-600 tracking-tighter">Menghubungkan ke Cloud...</p></div></div>;
+
+            return (
+                <div className="flex h-screen overflow-hidden bg-slate-50">
+                    {/* Sidebar */}
+                    <aside className="w-64 bg-white border-r border-slate-200 flex flex-col p-5 no-print shadow-sm z-20">
+                        <div className="flex items-center space-x-3 mb-10 px-2">
+                            <div className="bg-indigo-600 p-2.5 rounded-2xl shadow-lg shadow-indigo-100">
+                                <Icon name="cloud" className="text-white" size={24} />
+                            </div>
+                            <div>
+                                <h1 className="font-bold text-lg text-slate-800 leading-tight tracking-tighter">E-APBDes Cloud</h1>
+                                <p className="text-[10px] font-black text-indigo-500 tracking-tighter uppercase">ID: {appId.substring(0,8)}</p>
+                            </div>
+                        </div>
+
+                        <nav className="flex-1 space-y-1">
+                            {['dashboard', 'pendapatan', 'belanja', 'profil'].map(tab => (
+                                <button
+                                    key={tab}
+                                    onClick={() => setActiveTab(tab)}
+                                    className={`w-full flex items-center space-x-3 px-4 py-3 rounded-xl transition-all ${
+                                        activeTab === tab ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-500 hover:bg-slate-50'
+                                    }`}
+                                >
+                                    <Icon name={tab === 'dashboard' ? 'pie-chart' : tab === 'pendapatan' ? 'arrow-down-circle' : tab === 'belanja' ? 'arrow-up-circle' : 'settings'} />
+                                    <span className="font-bold text-sm capitalize">{tab}</span>
+                                </button>
+                            ))}
+                        </nav>
+
+                        <div className="mt-auto p-4 bg-slate-900 rounded-2xl text-white">
+                            <div className="flex items-center justify-between mb-2">
+                                <p className="text-[10px] text-slate-400 font-bold tracking-widest uppercase">Cloud Sync</p>
+                                <div className={`w-2 h-2 rounded-full ${syncStatus === 'synced' ? 'bg-green-400' : syncStatus === 'error' ? 'bg-red-400' : 'bg-yellow-400 animate-pulse'}`}></div>
+                            </div>
+                            <h4 className="text-sm font-bold truncate">{format(totalP - totalB)}</h4>
+                            <p className="text-[9px] text-slate-500 mt-1">User: {user?.uid.substring(0,10)}...</p>
+                        </div>
+                    </aside>
+
+                    {/* Main */}
+                    <main className="flex-1 overflow-y-auto p-8 relative">
+                        <div className="flex justify-between items-start mb-8">
+                            <div>
+                                <h2 className="text-2xl font-black text-slate-800 tracking-tight capitalize">{activeTab} Anggaran</h2>
+                                <p className="text-sm text-slate-500 font-medium">Data tersimpan di Cloud Server</p>
+                            </div>
+                            <div className="flex gap-2 no-print">
+                                <button onClick={() => window.print()} className="bg-white border p-2 rounded-xl shadow-sm hover:bg-slate-50 transition-all"><Icon name="printer" /></button>
+                                <button 
+                                    onClick={() => saveToCloud(dataDesa, pendapatan, belanja)} 
+                                    className="bg-indigo-600 text-white px-5 py-2 rounded-xl text-sm font-bold shadow-lg shadow-indigo-100 flex items-center gap-2 hover:bg-indigo-700 transition-colors"
+                                >
+                                    <Icon name="refresh-cw" size={16} className={syncStatus === 'syncing' ? 'animate-spin' : ''} /> 
+                                    {syncStatus === 'syncing' ? 'Menyimpan...' : 'Simpan ke Cloud'}
+                                </button>
+                            </div>
+                        </div>
+
+                        {activeTab === 'dashboard' && (
+                            <div className="space-y-6">
+                                <div className="bg-indigo-50 border border-indigo-100 p-4 rounded-2xl flex items-center gap-4">
+                                    <div className="bg-white p-2 rounded-lg text-indigo-600 shadow-sm"><Icon name="info" /></div>
+                                    <p className="text-xs text-indigo-800 font-medium">Aplikasi ini sekarang terhubung ke database cloud. Setiap perubahan akan disimpan secara permanen di server.</p>
+                                </div>
+
+                                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                                    {[
+                                        { l: 'Total Pendapatan', v: totalP, c: 'text-blue-600', i: 'download' },
+                                        { l: 'Total Belanja', v: totalB, c: 'text-orange-600', i: 'upload' },
+                                        { l: 'Batas Siltap (30%)', v: belanjaOp, c: 'text-indigo-600', i: 'users' }
+                                    ].map((s, i) => (
+                                        <div key={i} className="bg-white p-6 rounded-3xl shadow-sm border border-slate-100">
+                                            <div className="flex justify-between mb-4">
+                                                <p className="text-xs font-bold text-slate-400 uppercase tracking-widest">{s.l}</p>
+                                                <Icon name={s.i} className="text-slate-200" />
+                                            </div>
+                                            <h3 className={`text-xl font-black ${s.c}`}>{format(s.v)}</h3>
+                                        </div>
+                                    ))}
+                                </div>
+
+                                <div className="bg-white p-8 rounded-[2rem] border border-slate-100 shadow-sm">
+                                    <div className="flex items-center justify-between mb-6">
+                                        <h4 className="font-black text-slate-800">Evaluasi PP 11/2019</h4>
+                                        <span className={`px-4 py-1 rounded-full text-[10px] font-black uppercase ${rasioOp <= 30 ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                                            {rasioOp <= 30 ? 'Memenuhi Syarat' : 'Peringatan: Melebihi Batas'}
+                                        </span>
+                                    </div>
+                                    <div className="w-full bg-slate-100 h-4 rounded-full overflow-hidden">
+                                        <div className={`h-full transition-all duration-1000 ${rasioOp > 30 ? 'bg-red-500' : 'bg-indigo-600'}`} style={{ width: `${Math.min(rasioOp, 100)}%` }}></div>
+                                    </div>
+                                    <div className="flex justify-between mt-3 text-xs font-bold">
+                                        <span className="text-slate-400">Rasio Saat Ini: {rasioOp.toFixed(2)}%</span>
+                                        <span className="text-slate-500 underline decoration-red-400 decoration-2">Maksimal: 30.00%</span>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {(activeTab === 'pendapatan' || activeTab === 'belanja') && (
+                            <div className="bg-white rounded-3xl shadow-sm border border-slate-100 overflow-hidden">
+                                <div className="p-6 border-b border-slate-50 flex justify-between items-center">
+                                    <h3 className="font-black text-slate-800 capitalize">Data {activeTab}</h3>
+                                    <button 
+                                        onClick={() => {
+                                            if (activeTab === 'pendapatan') setPendapatan([...pendapatan, {id: Date.now(), kode: '4.0.0', sumber: 'Baru', nominal: 0}]);
+                                            else setBelanja([...belanja, {id: Date.now(), kode: '2.0.0', uraian: 'Baru', nominal: 0, jenis: 'Non-Operasional'}]);
+                                        }}
+                                        className="bg-indigo-50 p-2 rounded-xl text-indigo-600 hover:bg-indigo-600 hover:text-white transition-all shadow-sm"
+                                    >
+                                        <Icon name="plus" />
+                                    </button>
+                                </div>
+                                <div className="overflow-x-auto">
+                                    <table className="w-full text-left text-sm">
+                                        <thead className="bg-slate-50 text-[10px] font-black uppercase text-slate-400 tracking-widest">
+                                            <tr>
+                                                <th className="p-4">Kode Rekening</th>
+                                                <th className="p-4">Uraian / Sumber Dana</th>
+                                                <th className="p-4">Nominal (Rp)</th>
+                                                <th className="p-4 text-center">Aksi</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-slate-50">
+                                            {(activeTab === 'pendapatan' ? pendapatan : belanja).map((item, idx) => (
+                                                <tr key={item.id} className="hover:bg-slate-50/30 group transition-colors">
+                                                    <td className="p-4">
+                                                        <input className="bg-transparent border-none focus:ring-0 font-mono text-xs w-24" value={item.kode} onChange={(e) => {
+                                                            const n = [...(activeTab === 'pendapatan' ? pendapatan : belanja)];
+                                                            n[idx].kode = e.target.value;
+                                                            activeTab === 'pendapatan' ? setPendapatan(n) : setBelanja(n);
+                                                        }} />
+                                                    </td>
+                                                    <td className="p-4">
+                                                        <input className="bg-transparent border-none focus:ring-0 font-bold text-slate-700 w-full" value={activeTab === 'pendapatan' ? item.sumber : item.uraian} onChange={(e) => {
+                                                            const n = [...(activeTab === 'pendapatan' ? pendapatan : belanja)];
+                                                            if(activeTab === 'pendapatan') n[idx].sumber = e.target.value; else n[idx].uraian = e.target.value;
+                                                            activeTab === 'pendapatan' ? setPendapatan(n) : setBelanja(n);
+                                                        }} />
+                                                    </td>
+                                                    <td className="p-4">
+                                                        <input type="number" className="bg-transparent border-none focus:ring-0 font-black text-indigo-600 w-full" value={item.nominal} onChange={(e) => {
+                                                            const n = [...(activeTab === 'pendapatan' ? pendapatan : belanja)];
+                                                            n[idx].nominal = parseInt(e.target.value) || 0;
+                                                            activeTab === 'pendapatan' ? setPendapatan(n) : setBelanja(n);
+                                                        }} />
+                                                    </td>
+                                                    <td className="p-4 text-center opacity-0 group-hover:opacity-100">
+                                                        <button onClick={() => {
+                                                            if(activeTab === 'pendapatan') setPendapatan(pendapatan.filter(i => i.id !== item.id));
+                                                            else setBelanja(belanja.filter(i => i.id !== item.id));
+                                                        }} className="text-red-400 hover:text-red-600"><Icon name="trash-2" size={16} /></button>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        )}
+
+                        {activeTab === 'profil' && (
+                            <div className="bg-white p-8 rounded-[2rem] border shadow-sm grid grid-cols-1 md:grid-cols-2 gap-8">
+                                <div className="space-y-4">
+                                    <h5 className="text-[10px] font-black text-indigo-600 uppercase tracking-widest border-b pb-2">Identitas Desa</h5>
+                                    {['namaDesa', 'kecamatan', 'kabupaten', 'tahunAnggaran'].map(f => (
+                                        <div key={f}>
+                                            <label className="text-[10px] font-bold text-slate-400 uppercase ml-1 capitalize">{f.replace(/([A-Z])/g, ' $1')}</label>
+                                            <input className="w-full bg-slate-50 border-none rounded-xl px-4 py-2.5 text-sm font-bold focus:bg-white focus:ring-2 focus:ring-indigo-100 transition-all" value={dataDesa[f]} onChange={(e) => setDataDesa({...dataDesa, [f]: e.target.value})} />
+                                        </div>
+                                    ))}
+                                </div>
+                                <div className="space-y-4">
+                                    <h5 className="text-[10px] font-black text-indigo-600 uppercase tracking-widest border-b pb-2">Struktur Pemerintahan</h5>
+                                    {['kepalaDesa', 'sekretarisDesa', 'ketuaBPD'].map(f => (
+                                        <div key={f}>
+                                            <label className="text-[10px] font-bold text-slate-400 uppercase ml-1 capitalize">{f.replace(/([A-Z])/g, ' $1')}</label>
+                                            <input className="w-full bg-slate-50 border-none rounded-xl px-4 py-2.5 text-sm font-bold focus:bg-white focus:ring-2 focus:ring-indigo-100 transition-all" value={dataDesa[f]} onChange={(e) => setDataDesa({...dataDesa, [f]: e.target.value})} />
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+                    </main>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
